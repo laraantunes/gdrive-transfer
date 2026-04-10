@@ -10,10 +10,9 @@ A simple CLI-based PHP Script to transfer ownership of files and folders in Goog
 
 2. **OAuth2 Flow**: If credentials are missing or expired, the script will output a URL. Opening this URL in your browser will let you log in, authorize the app, and provide an authentication code to enter back into the terminal. The session is then saved to `token.json` so you don't have to authenticate every run.
 
-3. **Intelligent Ownership Logic**: Following your instructions, the script inspects the file's current permissions:
-   - If the user is already the `owner`, it does nothing.
-   - If the user has `reader` or no access, it grants `writer` permissions on the file first.
-   - Once writer access is confirmed, it upgrades their permission to `owner` and legally transfers ownership.
+3. **Ownership Logic & Consent Constraints**: Google Drive consumer accounts no longer allow forced ownership transfers. To solve the "Consent is required" error, this tool utilizes a two-step process:
+   - **Step 1 - Request (Old Account)**: The script grants `writer` permissions to the target email and flags them as a `pendingOwner`.
+   - **Step 2 - Accept (New Account)**: The receiving user runs the script as themselves to officially accept the pending transfer by setting `transferOwnership` to true.
 
 4. **Error Handling & Rate Limits**: Due to Google's API Quotas, we can only perform so many actions in a row. The script will automatically intercept `Rate Limit Exceeded` errors and employ **exponential backoff**, sleeping for a few seconds before automatically continuing.
 
@@ -21,11 +20,22 @@ A simple CLI-based PHP Script to transfer ownership of files and folders in Goog
 
 Open up a terminal (such as Command Prompt or PowerShell) pointing to `d:\Lara\xampp8.2\htdocs\gdrive-transfer`.
 
-Run a test with a specific folder ID using the following format:
+### Step 1: Request Ownership Transfer
+Run this authenticated as the **current owner**:
 ```bash
-php index.php --email=new_owner@gmail.com --folder_id=YOUR_TEST_FOLDER_ID
+php index.php --email=new_owner@gmail.com --folder_id=YOUR_TEST_FOLDER_ID --action=request
 ```
 > [!TIP]
 > You can find a folder's ID in Google Drive by opening it in your browser and grabbing the long string of letters & numbers at the end of the URL.
+> For the first time, running without `--action` will automatically default to `request`.
+
+### Step 2: Accept Ownership Transfer
+Because Google requires explicit consent, you must now run the script authenticated as the **new owner** to finalize the transfers.
+1. Delete your `token.json` file in the folder to clear the old account's session.
+2. Run the accept command:
+```bash
+php index.php --email=new_owner@gmail.com --folder_id=YOUR_TEST_FOLDER_ID --action=accept
+```
+3. Authenticate in the browser window using the **new owner's** google account.
 
 Watch the terminal output as it processes each file. Ensure the test folder and its contents successfully migrate before attempting a larger folder!

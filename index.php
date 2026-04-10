@@ -7,20 +7,32 @@ if (php_sapi_name() !== 'cli') {
     die("This script must be run from the command line.\n");
 }
 
-$options = getopt("", ["email:", "folder_id::"]);
+$options = getopt("", ["email:", "folder_id::", "action::"]);
 
 if (!isset($options['email'])) {
-    die("Usage: php index.php --email=<new_owner_email> [--folder_id=<optional_folder_id>]\n");
+    die("Usage: php index.php --email=<email> [--folder_id=<optional_folder_id>] [--action=request|accept]\n");
 }
 
-$newOwnerEmail = $options['email'];
+$email = $options['email'];
 $rootFolderId = isset($options['folder_id']) && !empty($options['folder_id']) ? $options['folder_id'] : 'root';
+$action = isset($options['action']) ? $options['action'] : 'request';
+
+if (!in_array($action, ['request', 'accept'])) {
+    die("Invalid action. Must be 'request' or 'accept'.\n");
+}
 
 echo "Starting Google Drive ownership transfer...\n";
-echo "New Owner Email: $newOwnerEmail\n";
-echo "Root Folder ID: $rootFolderId\n";
+echo "Action: " . strtoupper($action) . "\n";
+echo "Target Email: $email\n";
+echo "Root Folder ID: $rootFolderId\n\n";
 
-function getClient() {
+if ($action === 'accept') {
+    echo "WARNING: You must be authenticated as the NEW owner ($email) to accept transfers.\n";
+    echo "If you are still authenticated as the old owner, delete token.json and re-run.\n\n";
+}
+
+function getClient()
+{
     $client = new Google_Client();
     $client->setApplicationName('Google Drive Ownership Transfer');
     $client->setScopes(Google_Service_Drive::DRIVE);
@@ -39,7 +51,7 @@ function getClient() {
             $client->fetchAccessTokenWithRefreshToken($client->getRefreshToken());
         } else {
             $authUrl = $client->createAuthUrl();
-            printf("Open the following link in your browser:\n%s\n", $authUrl);
+            printf("Open the following link in your browser to authenticate:\n%s\n\n", $authUrl);
             print 'Enter verification code: ';
             $authCode = trim(fgets(STDIN));
 
@@ -58,18 +70,25 @@ function getClient() {
     return $client;
 }
 
-function updateOwnership($service, $fileId, $newOwnerEmail, $permissions, $retryNum = 0) {
+function processOwnership($service, $fileId, $targetEmail, $permissions, $action, $retryNum = 0)
+{
     try {
         $alreadyOwner = false;
-        $writerPermissionId = null;
+        $targetPermissionId = null;
+        $targetPermissionRole = null;
+        $isPendingOwner = false;
 
         if ($permissions) {
             foreach ($permissions as $permission) {
-                if (isset($permission->emailAddress) && strtolower($permission->emailAddress) === strtolower($newOwnerEmail)) {
-                    if ($permission->getRole() === 'owner') {
+                if (isset($permission->emailAddress) && strtolower($permission->emailAddress) === strtolower($targetEmail)) {
+                    $targetPermissionRole = $permission->getRole();
+                    if ($targetPermissionRole === 'owner') {
                         $alreadyOwner = true;
                     } else {
-                        $writerPermissionId = $permission->getId();
+                        $targetPermissionId = $permission->getId();
+                        if ($permission->getPendingOwner()) {
+                            $isPendingOwner = true;
+                        }
                     }
                 }
             }
@@ -80,51 +99,107 @@ function updateOwnership($service, $fileId, $newOwnerEmail, $permissions, $retry
             return true;
         }
 
-        echo " - Transferring ownership...\n";
+        if ($action === 'request') {
+            if ($isPendingOwner) {
+                echo " - Already requested (Pending Owner).\n";
+                return true;
+            }
 
-        if (!$writerPermissionId) {
-            echo "   - Adding as writer first...\n";
-            $newPermission = new Google_Service_Drive_Permission(array(
-                'type' => 'user',
+            echo " - Requesting ownership transfer...\n";
+
+            // Step 1: Ensure they are a writer FIRST (pendingOwnerWriterRequired)
+            if (!$targetPermissionId) {
+                echo "   - Adding as writer first...\n";
+                $newPermission = new Google_Service_Drive_Permission(array(
+                    'type' => 'user',
+                    'role' => 'writer',
+                    'emailAddress' => $targetEmail
+                ));
+                $createdPerm = $service->permissions->create($fileId, $newPermission, array('sendNotificationEmail' => false));
+                $targetPermissionId = $createdPerm->getId();
+            } elseif ($targetPermissionRole !== 'writer') {
+                echo "   - Upgrading existing permission to writer first...\n";
+                $upgradePermission = new Google_Service_Drive_Permission(array(
+                    'role' => 'writer'
+                ));
+                $service->permissions->update($fileId, $targetPermissionId, $upgradePermission);
+            }
+
+            // Step 2: Now we can safely send the pending ownership request
+            echo "   - Setting pending ownership...\n";
+            $updatePermission = new Google_Service_Drive_Permission(array(
                 'role' => 'writer',
-                'emailAddress' => $newOwnerEmail
+                'pendingOwner' => true
             ));
-            $createdPerm = $service->permissions->create($fileId, $newPermission, array('sendNotificationEmail' => false));
-            $writerPermissionId = $createdPerm->getId();
-            usleep(500000); // Wait 0.5s for propagation
+
+            $propSuccess = false;
+            $propRetry = 0;
+            while (!$propSuccess && $propRetry < 5) {
+                try {
+                    // We only update the pendingOwner flag. We do NOT pass transferOwnership=true here because that's only allowed when role='owner'
+                    $service->permissions->update($fileId, $targetPermissionId, $updatePermission);
+                    $propSuccess = true;
+                    echo "   - Request sent!\n";
+                } catch (Exception $e) {
+                    $propMsg = $e->getMessage();
+                    if (strpos($propMsg, 'pendingOwnerWriterRequired') !== false) {
+                        $propRetry++;
+                        echo "   - Google backend delay detected. Waiting 2s before retry $propRetry...\n";
+                        sleep(2);
+                    } elseif (strpos($propMsg, 'Rate Limit') !== false || strpos($propMsg, 'quota') !== false) {
+                        // Pass it up to the main catch block for exponential backoff
+                        throw $e;
+                    } else {
+                        // Some other error
+                        throw $e;
+                    }
+                }
+            }
+
+        } elseif ($action === 'accept') {
+
+            if (!$targetPermissionId) {
+                echo " - Error: Target email does not have a permission ID to update on this file (They must be a pendingOwner first).\n";
+                return false;
+            }
+
+            echo " - Accepting pending ownership transfer...\n";
+            $ownerPermission = new Google_Service_Drive_Permission(array(
+                'role' => 'owner'
+            ));
+
+            $service->permissions->update($fileId, $targetPermissionId, $ownerPermission, array(
+                'transferOwnership' => true
+            ));
+            echo "   - Success! Now the owner.\n";
         }
-        
-        // Transfer ownership
-        $ownerPermission = new Google_Service_Drive_Permission(array(
-            'role' => 'owner'
-        ));
-        
-        $service->permissions->update($fileId, $writerPermissionId, $ownerPermission, array(
-            'transferOwnership' => true,
-        ));
-        
-        echo "   - Success!\n";
+
         return true;
-        
+
     } catch (Exception $e) {
         $msg = $e->getMessage();
         echo "   - Error: " . $msg . "\n";
-        
-        // Retry logic for rate limits/quota exceeded
+
         if ($retryNum < 3 && (strpos($msg, 'Rate Limit Exceeded') !== false || strpos($msg, 'User Rate Limit Exceeded') !== false || strpos($msg, 'quotaExceeded') !== false)) {
-            $sleepTime = pow(2, $retryNum) * 2; // exponential backoff
-            echo "   - Sleeping for $sleepTime seconds before retrying...\n";
+            $sleepTime = pow(2, $retryNum) * 2;
+            echo "   - Sleeping for $sleepTime seconds before retrying overall process...\n";
             sleep($sleepTime);
-            return updateOwnership($service, $fileId, $newOwnerEmail, $permissions, $retryNum + 1);
+            // Before full retry, we should clear targetPermissionId so logic evaluates fresh if we re-enter loop
+            return processOwnership($service, $fileId, $targetEmail, $permissions, $action, $retryNum + 1);
         }
         return false;
     }
 }
 
-function transferOwnershipRecursive($service, $folderId, $newOwnerEmail) {
+
+function transferOwnershipRecursive($service, $folderId, $targetEmail, $action)
+{
+    // If accepting, maybe only search for pendingOwner?
+    // But since this is recursive folder traversal, we'll traverse and accept anything with pendingOwner=true
+
     echo "Processing folder ID: $folderId\n";
     $pageToken = null;
-    
+
     do {
         try {
             $optParams = array(
@@ -134,25 +209,24 @@ function transferOwnershipRecursive($service, $folderId, $newOwnerEmail) {
                 'pageSize' => 50
             );
             $results = $service->files->listFiles($optParams);
-            
+
             foreach ($results->getFiles() as $file) {
                 echo "Processing: " . $file->getName() . " (" . $file->getId() . ")\n";
-                
-                updateOwnership($service, $file->getId(), $newOwnerEmail, $file->getPermissions());
+
+                processOwnership($service, $file->getId(), $targetEmail, $file->getPermissions(), $action);
 
                 if ($file->getMimeType() === 'application/vnd.google-apps.folder') {
                     // Recurse into this folder
-                    transferOwnershipRecursive($service, $file->getId(), $newOwnerEmail);
+                    transferOwnershipRecursive($service, $file->getId(), $targetEmail, $action);
                 }
             }
-            
+
             $pageToken = $results->getNextPageToken();
         } catch (Exception $e) {
             echo "Error listing files in folder $folderId: " . $e->getMessage() . "\n";
             echo "Sleeping for 5 seconds before attempting to continue...\n";
             sleep(5);
-            // It could be rate limit, we will just clear pageToken and skip remaining in this directory to avoid infinite loops, but ideally more robust retry could be added here.
-            $pageToken = null; 
+            $pageToken = null;
         }
     } while ($pageToken != null);
 }
@@ -160,8 +234,9 @@ function transferOwnershipRecursive($service, $folderId, $newOwnerEmail) {
 try {
     $client = getClient();
     $service = new Google_Service_Drive($client);
-    transferOwnershipRecursive($service, $rootFolderId, $newOwnerEmail);
-    echo "Transfer completed.\n";
+    transferOwnershipRecursive($service, $rootFolderId, $email, $action);
+    echo "Process completed.\n";
 } catch (Exception $e) {
     echo "Fatal error: " . $e->getMessage() . "\n";
 }
+
