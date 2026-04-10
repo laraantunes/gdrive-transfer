@@ -1,6 +1,6 @@
-# Google Drive Transfer Script Walkthrough
+# Google Drive Transfer Script
 
-I've successfully converted your `index.php` into a robust CLI tool designed to recursively transfer file and folder ownership within Google Drive without crashing due to server timeouts.
+A simple CLI-based PHP Script to transfer ownership of files and folders in Google Drive to another user.
 
 ## Changes Made
 
