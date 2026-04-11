@@ -136,22 +136,35 @@ function processOwnership($service, $fileId, $targetEmail, $permissions, $action
             $propRetry = 0;
             while (!$propSuccess && $propRetry < 5) {
                 try {
-                    // We only update the pendingOwner flag. We do NOT pass transferOwnership=true here because that's only allowed when role='owner'
+                    // We only update the pendingOwner flag.
                     $service->permissions->update($fileId, $targetPermissionId, $updatePermission);
                     $propSuccess = true;
                     echo "   - Request sent!\n";
                 } catch (Exception $e) {
                     $propMsg = $e->getMessage();
                     if (strpos($propMsg, 'pendingOwnerWriterRequired') !== false) {
-                        $propRetry++;
-                        echo "   - Google backend delay detected. Waiting 2s before retry $propRetry...\n";
-                        sleep(2);
-                    } elseif (strpos($propMsg, 'Rate Limit') !== false || strpos($propMsg, 'quota') !== false) {
-                        // Pass it up to the main catch block for exponential backoff
-                        throw $e;
+                        try {
+                            echo "   - Inherited permission detected. Promoting to direct permission...\n";
+                            $directPerm = new Google_Service_Drive_Permission(array(
+                                'type' => 'user',
+                                'role' => 'writer',
+                                'emailAddress' => $targetEmail,
+                                'pendingOwner' => true
+                            ));
+                            $service->permissions->create($fileId, $directPerm, array('sendNotificationEmail' => false));
+                            $propSuccess = true;
+                            echo "   - Request sent directly!\n";
+                        } catch (Exception $e2) {
+                            throw $e2;
+                        }
                     } else {
-                        // Some other error
-                        throw $e;
+                        // Print the exact error so we can debug it
+                        echo "   - Exception caught during update: " . $propMsg . "\n";
+                        if (strpos($propMsg, 'Rate Limit') !== false || strpos($propMsg, 'quota') !== false) {
+                            throw $e;
+                        } else {
+                            throw $e;
+                        }
                     }
                 }
             }
@@ -160,6 +173,11 @@ function processOwnership($service, $fileId, $targetEmail, $permissions, $action
 
             if (!$targetPermissionId) {
                 echo " - Error: Target email does not have a permission ID to update on this file (They must be a pendingOwner first).\n";
+                return false;
+            }
+
+            if (!$isPendingOwner) {
+                echo " - Error: Target email is NOT a pending owner on this file. You must run the 'request' action from the old account first.\n";
                 return false;
             }
 
