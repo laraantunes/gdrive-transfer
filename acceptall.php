@@ -53,7 +53,7 @@ function getClient()
 try {
     $client = getClient();
     $service = new Google_Service_Drive($client);
-    
+
     // Attempt to get the logged-in user's email
     $myEmail = 'unknown';
     try {
@@ -63,14 +63,14 @@ try {
     } catch (Exception $e) {
         echo "Could not fetch user info, proceeding anyway. (" . $e->getMessage() . ")\n";
     }
-    
+
     echo "Scanning all visible files (excluding ones you already own) for pending ownership...\n";
-    
+
     $pageToken = null;
     $processedCount = 0;
     $acceptedCount = 0;
     $pageCount = 0;
-    
+
     do {
         try {
             $pageCount++;
@@ -88,36 +88,36 @@ try {
             if (empty($files)) {
                 echo "Page $pageCount: No new candidates found on this page. Continuing scan...\n";
             }
-            
+
             foreach ($files as $file) {
                 $processedCount++;
                 $permissions = $file->getPermissions();
                 $targetPermissionId = null;
                 $isPendingOwner = false;
-                
+
                 if ($permissions) {
                     foreach ($permissions as $permission) {
                         $isUserMatch = false;
                         if (isset($permission->emailAddress) && $myEmail !== 'unknown' && strtolower($permission->emailAddress) === strtolower($myEmail)) {
                             $isUserMatch = true;
                         }
-                        
+
                         // If it explicitly matches our email OR if the permission has pendingOwner=true
                         // (as the active user can generally only see/accept their own pending statuses)
                         if ($isUserMatch || $permission->getPendingOwner()) {
-                             if ($permission->getPendingOwner()) {
+                            if ($permission->getPendingOwner()) {
                                 $targetPermissionId = $permission->getId();
                                 $isPendingOwner = true;
                                 break;
-                             }
+                            }
                         }
                     }
                 }
-                
+
                 if ($isPendingOwner && $targetPermissionId) {
                     echo "Found pending ownership for: " . $file->getName() . " (" . $file->getId() . ")\n";
                     echo " - Accepting...\n";
-                    
+
                     $retryNum = 0;
                     $success = false;
                     while (!$success && $retryNum < 5) {
@@ -151,16 +151,17 @@ try {
             $pageToken = $results->getNextPageToken();
             if ($processedCount > 0 && $processedCount % 500 === 0) {
                 echo "Processed $processedCount files (not owned by me) so far across $pageCount pages...\n";
+                break;
             }
         } catch (Exception $e) {
             echo "Error listing files: " . $e->getMessage() . "\n";
             $msg = $e->getMessage();
             if (strpos($msg, 'Rate Limit') !== false || strpos($msg, 'quota') !== false) {
-                 echo "Sleeping for 10 seconds before continuing list iteration...\n";
-                 sleep(10);
+                echo "Sleeping for 10 seconds before continuing list iteration...\n";
+                sleep(10);
             } else {
-                 echo "Non-retryable error during list. Aborting scan.\n";
-                 break;
+                echo "Non-retryable error during list. Aborting scan.\n";
+                break;
             }
         }
     } while (!empty($pageToken));
